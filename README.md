@@ -1,56 +1,290 @@
 # AI Notetaker
 
-A voice-first notetaking app: record a thought out loud, and it's automatically transcribed, distilled into structured tasks/decisions/ideas, and made queryable through a chat interface — with citations back to the source note.
+A voice-first notetaker: record a thought out loud, and it's automatically transcribed, distilled into structured tasks / decisions / ideas, stored, and made queryable through a chat interface — with citations back to the source note.
 
-## What you built
+Built as a 24-hour take-home project. Developed on Windows without Xcode access, so the client is React Native (Expo) rather than native Swift, tested live on a physical iPhone via Expo Go.
 
-**`frontend/`** — a React Native (Expo, TypeScript) mobile client. It records audio, uploads it to the backend, and renders whatever structured data comes back: a Home feed of captured "contexts," a full-screen recording UI with a live waveform and timer, an editable Note Detail view with AI-assist tools (summarize, re-classify, copy to clipboard), and a persistent Chat screen with source-citation chips. The client holds no business logic of its own — it records, uploads, and displays.
+---
 
-**`backend/`** — a Python FastAPI service backed by SQLite. It handles audio transcription, LLM-based structured extraction (tasks, deadlines, decisions, ideas, names, a title), full note CRUD, task aggregation, and a chat endpoint that answers questions using the user's own notes as context, citing which notes it drew on.
+## Table of Contents
 
-## Your product decisions
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Core Pipeline: Record → Chat](#core-pipeline-record--chat)
+- [Data Model](#data-model)
+- [API Reference](#api-reference)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [Product Decisions](#product-decisions)
+- [Shortcuts, Assumptions & Limitations](#shortcuts-assumptions--limitations)
+- [What's Next](#whats-next)
 
-- **Auto-pruning empty notes.** Voice capture inevitably includes mic tests, false starts, and "never mind" moments. If we saved every recording verbatim, the note feed would quickly fill with noise, and the user would stop trusting (and using) it. We discard a note server-side if the transcript is under 5 words, or if extraction finds no concrete tasks, decisions, or ideas — so the feed only ever contains something worth coming back to.
-- **Strict JSON schemas for extraction.** Rather than parsing free-text LLM output with regex or string-matching, the backend forces the model into JSON mode with an exact schema (`title`, `tasks`, `deadlines`, `decisions`, `ideas`, `names_mentioned`), validated again on the way out through Pydantic response models. This makes storage and retrieval deterministic and type-safe, and makes failures explicit (a JSON parse error, not silently mangled data) rather than fragile.
-- **Clean UI over ambient background listening.** For this MVP, recording is explicit and user-initiated rather than always-on. Ambient listening raises real privacy concerns (recording without a clear start/stop moment), costs battery and data continuously, and needs voice-activity detection and wake-word handling that's a project of its own. A deliberate "tap to record" flow was the right scope for the time available, and it made the rest of the product — accurate transcripts, trustworthy extraction, a fast feed — much more solid than spreading effort across always-on capture too.
+---
 
-## Your technical architecture
+## Overview
 
-The client and server are fully decoupled over HTTP on the local network (the mobile app points at the backend's LAN IP). The backend is the single source of truth: SQLite holds two tables, `notes` (raw transcript, title, summary, audio filename) and `structured_items` (typed rows — task/deadline/decision/idea/name — foreign-keyed to a note).
+| | |
+|---|---|
+| **Client** | React Native (Expo, TypeScript) — dumb client: records, uploads, renders |
+| **Backend** | Python (FastAPI) — the Context Engine; all transcription, extraction, storage, retrieval, and chat logic |
+| **Database** | SQLite (`notes` + `structured_items`) |
+| **Speech-to-Text** | Groq `whisper-large-v3-turbo` (OpenAI-compatible API) |
+| **LLM (extraction, chat, summarize)** | Groq `openai/gpt-oss-120b` |
 
-All AI calls go through **Groq's OpenAI-compatible API** (`https://api.groq.com/openai/v1`, via the standard `openai` Python SDK pointed at that base URL) — chosen specifically to keep the whole project on a free tier rather than requiring a paid OpenAI key. Groq's `whisper-large-v3-turbo` handles transcription. For structured extraction, summarization, and chat, the backend uses `openai/gpt-oss-120b` — **not Llama 3** as originally planned: Groq deprecated the Llama 3.x models from this account's catalog mid-project, so the extraction/chat/summarization model was swapped to their current flagship open-weight model instead. (Flagging this explicitly since it's a deviation from the original brief.)
+> **Why Groq instead of OpenAI?** The brief specified Whisper + GPT-4o-mini. To keep the whole project runnable on a free tier (no billing setup required to grade or demo it), all AI calls were routed through Groq's OpenAI-compatible endpoint instead — same SDK, same request shape, different `base_url` and API key. Llama 3 was the original extraction/chat model choice but was deprecated from Groq's catalog mid-build, so the backend was pointed at their current flagship open-weight model (`openai/gpt-oss-120b`) instead. This is a deliberate, documented substitution, not a missed requirement.
 
-## How you clean and structure captured context
+---
 
-The extraction system prompt (`backend/app/services/extraction.py`) does two jobs at once: it tells the model what to throw away, and what shape to return.
+## Architecture
 
-On the "throw away" side, it explicitly instructs the model to drop filler words, false starts, small talk, and — after an early bug where "never mind, I'll do this later" was hallucinated into a task — any statement built on an unresolved pronoun ("this", "that", "it") with no stated subject. A task, deadline, decision, or idea only survives if it names something concrete.
+```mermaid
+flowchart LR
+    subgraph Phone["📱 iPhone (Expo Go)"]
+        A[RecordingScreen] -->|.m4a audio| B[api.ts]
+        H[HomeScreen] --> B
+        C[ChatScreen] --> B
+        D[NoteDetailScreen] --> B
+    end
 
-On the "shape" side, the model is forced into JSON mode (`response_format={"type": "json_object"}`) against an exact schema, including a 3–5 word `title` generated per note. That JSON is then walked by `main.py` into typed `StructuredItem` rows (one per task/deadline/decision/idea/name) and a `Note` row, both validated through Pydantic schemas (`NoteOut`, `StructuredItemOut`) before ever reaching the client. If the model's JSON doesn't parse, extraction retries once before the note falls back to raw-transcript-only rather than crashing the request.
+    subgraph Backend["🖥️ FastAPI — Context Engine"]
+        E[/notes/upload/]
+        F[/chat/]
+        G[/notes, /tasks, CRUD/]
+        DB[(SQLite\nnotes + structured_items)]
+    end
 
-## How your chat retrieves and uses that context
+    subgraph AI["☁️ Groq (OpenAI-compatible API)"]
+        W[whisper-large-v3-turbo]
+        L[openai/gpt-oss-120b]
+    end
 
-Given the 24-hour project scope, retrieval is intentionally simple rather than a full RAG pipeline: `/chat` queries SQLite for every note (`ORDER BY created_at DESC`) along with its structured items, and flattens all of it into one text context block — no vector search, no chunking, no embeddings.
+    B -->|HTTP over LAN| E
+    B --> F
+    B --> G
+    E -->|1. transcribe| W
+    E -->|2. extract JSON| L
+    E -->|3. store| DB
+    F -->|fetch all notes| DB
+    F -->|answer + cite| L
+    G <--> DB
+```
 
-That context plus the user's question goes to the LLM in JSON mode, with the model required to return `{"answer": string, "source_note_ids": [integer]}` — it names which notes it actually drew on, not just answers freely. The backend cross-references those IDs against the notes it queried (so a hallucinated or stale ID can't leak through), attaches each real match's timestamp and title, and returns them as a `sources` array alongside the answer. The mobile Chat screen renders each source as a tappable citation chip (`📌 Source: ...`) that opens the referenced note directly.
+The client and server are fully decoupled over HTTP on the local network — the mobile app points at the backend's LAN IP (`config.ts`). The backend is the single source of truth; the app holds **no business logic** of its own.
 
-## What you would improve with another week
+---
 
-- **Vector embeddings (Pinecone or Chroma) instead of dump-all-rows retrieval.** The current "fetch everything into context" approach works at a handful of notes but won't scale — past a modest note count it'll blow the context window and get slower and more expensive per chat call. Real semantic search would fix both.
-- **True background ambient listening**, with on-device voice-activity detection so the app can passively capture context without an explicit tap, while still respecting the privacy tradeoffs mentioned above (e.g. a clear visual/audio cue whenever it's actively recording).
-- Real audio-level metering for the recording waveform (currently simulated animation, not driven by actual mic input).
-- A proper migration tool (Alembic) instead of the ad hoc `ALTER TABLE` check used to add the `title`/`summary` columns.
-- Persisted "done" state for action items (currently a session-local, unsaved checklist), and real freeform tags/categories/reminders (currently placeholder UI elements).
-- An automated test suite — testing so far has been manual (`curl` against every endpoint, `tsc`/`expo-doctor`/bundle-export checks on the client) rather than CI-backed.
+## Tech Stack
 
-## Any shortcuts, assumptions, or limitations
+**Frontend** (`frontend/`)
+- Expo SDK 57, React Native 0.86, TypeScript (strict mode)
+- `expo-audio` for mic capture, `expo-file-system` for multipart upload, `expo-clipboard`, `@react-native-async-storage/async-storage`
+- Screens: `HomeScreen`, `RecordingScreen`, `NoteDetailScreen`, `ChatScreen`, `SettingsScreen`, `TabBar`
 
-Due to developing on a Windows machine without access to macOS/Xcode, I built the client using React Native (Expo) to ensure native iOS device testing, while focusing my engineering efforts on the Context Engine backend as permitted by the technical freedom clause.
+**Backend** (`backend/`)
+- FastAPI + Uvicorn, SQLAlchemy ORM, Pydantic v2 schemas
+- SQLite file database, lightweight startup migrations (`ALTER TABLE` guard for added columns)
+- `openai` Python SDK pointed at Groq's `base_url` for transcription, extraction, summarization, and chat
 
-Other notable shortcuts and assumptions:
+---
 
-- **No authentication** — the app assumes a single implicit user; there's no login, and every note is globally visible to whoever can reach the backend's URL.
-- **CORS is wide open** (`allow_origins=["*"]`), which is fine for local development but not production-safe.
-- **Model substitution under free-tier constraints:** the brief originally called for OpenAI (Whisper-1, GPT-4o-mini). To keep the project fully free, the backend was moved to Groq's API (`whisper-large-v3-turbo`, `openai/gpt-oss-120b`) instead — see the architecture section above for why the model further changed mid-project.
-- **The database schema evolved without a migration framework** — new columns are added via a small startup check that runs `ALTER TABLE` if a column is missing, which works for this project's scope but wouldn't scale to a real schema-versioning need.
-- **No push notifications, background jobs, or offline queueing** — if the backend is unreachable, an upload or chat request simply fails with a retry option in the UI; it isn't queued for later.
+## Core Pipeline: Record → Chat
+
+### 1. Capture → Transcribe → Extract → Store
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as Expo App
+    participant API as FastAPI
+    participant Whisper as Groq Whisper
+    participant LLM as Groq LLM
+    participant DB as SQLite
+
+    U->>App: Tap Record, speak, tap Stop
+    App->>API: POST /notes/upload (audio file)
+    API->>Whisper: transcribe_audio()
+    Whisper-->>API: raw transcript
+    alt transcript < 5 words
+        API-->>App: {status: "discarded"}
+    else
+        API->>LLM: extract_structured_data() [JSON mode, temp=0]
+        LLM-->>API: {title, tasks[], deadlines[], decisions[], ideas[], names_mentioned[]}
+        alt no tasks/decisions/ideas found
+            API-->>App: {status: "discarded"}
+        else
+            API->>DB: INSERT Note + StructuredItem rows
+            API-->>App: NoteOut (structured JSON)
+            App-->>U: Render grouped results
+        end
+    end
+```
+
+If the LLM's JSON response fails to parse, extraction is retried once before falling back to a raw-transcript-only note rather than crashing the request.
+
+### 2. Chat (Retrieval-Augmented Answering)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as ChatScreen
+    participant API as FastAPI /chat
+    participant DB as SQLite
+    participant LLM as Groq LLM
+
+    U->>App: "What did I promise to do?"
+    App->>API: POST /chat {question}
+    API->>DB: SELECT all notes + structured_items
+    DB-->>API: rows
+    API->>API: flatten into one text context block
+    API->>LLM: context + question [JSON mode]
+    LLM-->>API: {answer, source_note_ids[]}
+    API->>API: cross-check IDs against queried notes\n(blocks hallucinated/stale IDs)
+    API-->>App: {answer, sources: [{id, timestamp, title}]}
+    App-->>U: Answer + tappable "📌 Source" chips
+```
+
+Given the 24-hour scope, retrieval is intentionally simple: **no vector database, no chunking, no embeddings** — every note is fetched and flattened into context on each chat call. This is honest about its scaling ceiling (see [What's Next](#whats-next)).
+
+---
+
+## Data Model
+
+```mermaid
+erDiagram
+    NOTES ||--o{ STRUCTURED_ITEMS : contains
+    NOTES {
+        int id PK
+        datetime created_at
+        text raw_transcript
+        text audio_filename "nullable"
+        text title "nullable"
+        text summary "nullable"
+    }
+    STRUCTURED_ITEMS {
+        int id PK
+        int note_id FK
+        enum type "task | deadline | decision | idea | name | other"
+        text content
+        text due_date "nullable, ISO or relative phrase"
+        datetime created_at
+    }
+```
+
+Extraction output is walked into typed `StructuredItem` rows and validated through Pydantic response models (`NoteOut`, `StructuredItemOut`) before it ever reaches the client — storage and retrieval are deterministic and type-safe, not regex-parsed free text.
+
+---
+
+## API Reference
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | DB connectivity check |
+| `GET` | `/notes` | All notes + structured items, newest first |
+| `POST` | `/notes/upload` | Upload audio → transcribe → extract → store |
+| `POST` | `/notes/manual` | Same pipeline, from typed text instead of audio |
+| `PUT` | `/notes/{id}` | Edit title, summary, or structured items |
+| `DELETE` | `/notes/{id}` | Delete one note (+ its audio file) |
+| `DELETE` | `/notes` | Delete all notes |
+| `POST` | `/notes/{id}/summarize` | Generate a 2-sentence executive summary |
+| `POST` | `/notes/{id}/reclassify` | Re-run extraction on the existing transcript |
+| `GET` | `/tasks` | All extracted task items across notes |
+| `POST` | `/chat` | Ask a question; get an answer + cited source notes |
+
+---
+
+## Project Structure
+
+```
+AI-Notetaker/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # routes
+│   │   ├── models.py            # SQLAlchemy: Note, StructuredItem
+│   │   ├── schemas.py           # Pydantic request/response models
+│   │   ├── database.py          # engine, session, lightweight migrations
+│   │   └── services/
+│   │       ├── transcription.py # Whisper call
+│   │       ├── extraction.py    # structured extraction prompt + call
+│   │       ├── summarize.py     # note summarization
+│   │       └── chat.py          # RAG-style chat answering
+│   ├── requirements.txt
+│   └── .env.example             # GROQ_API_KEY=
+└── frontend/
+    ├── App.tsx                  # tab navigation shell
+    ├── HomeScreen.tsx           # note feed
+    ├── RecordingScreen.tsx      # record UI, live waveform, timer
+    ├── NoteDetailScreen.tsx     # edit note, AI-assist actions
+    ├── ChatScreen.tsx           # chat + citation chips
+    ├── SettingsScreen.tsx
+    ├── api.ts                   # all backend calls
+    ├── config.ts                # API_BASE_URL (set to your LAN IP)
+    └── types.ts
+```
+
+---
+
+## Getting Started
+
+### Backend
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
+cp .env.example .env        # then add your GROQ_API_KEY
+uvicorn app.main:app --reload
+```
+
+Verify: `curl http://localhost:8000/health` → `{"status":"ok"}`
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+```
+
+Edit `config.ts` and replace the placeholder with your machine's LAN IP (find it with `ipconfig` on Windows or `ifconfig` on Mac/Linux — `localhost` will not work from a physical device):
+
+```ts
+export const API_BASE_URL = 'http://<YOUR_LAN_IP>:8000';
+```
+
+Then:
+
+```bash
+npx expo start
+```
+
+Scan the QR code with **Expo Go** on your phone. Phone and computer must be on the same Wi-Fi network, and the backend must be running.
+
+---
+
+## Product Decisions
+
+- **Auto-pruning empty notes.** Voice capture inevitably includes mic tests, false starts, and "never mind" moments. A note is discarded server-side if the transcript is under 5 words, or if extraction finds no concrete tasks, decisions, or ideas — so the feed only ever holds something worth returning to.
+- **Strict JSON schemas for extraction.** The model is forced into JSON mode against an exact schema, then re-validated through Pydantic on the way out. Failures are explicit (a JSON parse error with a retry-then-fallback path) rather than silently mangled data.
+- **Explicit tap-to-record over always-on ambient listening.** Always-on capture raises real privacy concerns, costs battery/data continuously, and needs voice-activity detection that's a project of its own. A deliberate record flow was the right scope for 24 hours, and it made the rest of the pipeline (accurate transcripts, trustworthy extraction, a fast feed) solid rather than spreading effort thin.
+
+---
+
+## Shortcuts, Assumptions & Limitations
+
+- **No authentication** — single implicit user; any client reaching the backend URL sees every note.
+- **CORS is wide open** (`allow_origins=["*"]`) — fine for local dev, not production-safe.
+- **Model substitution under free-tier constraints** — OpenAI (Whisper-1 / GPT-4o-mini) swapped for Groq (`whisper-large-v3-turbo` / `openai/gpt-oss-120b`); see [Overview](#overview).
+- **No formal migration framework** — new columns are added via a startup `ALTER TABLE` guard, workable at this scope but not schema-versioned.
+- **No push notifications, background jobs, or offline queueing** — a failed request surfaces a retry option in the UI; it isn't queued.
+- **Retrieval is "fetch everything," not real RAG** — see below.
+
+---
+
+## What's Next
+
+- **Real vector retrieval** (Pinecone/Chroma + embeddings) in place of dumping every note into the chat context — the current approach won't scale past a modest note count.
+- **True ambient listening** with on-device voice-activity detection, paired with a clear recording indicator to preserve the privacy tradeoff noted above.
+- **Real audio-level metering** for the recording waveform (currently a simulated animation, not driven by actual mic input).
+- **Alembic migrations** instead of the ad hoc `ALTER TABLE` startup check.
+- **Persisted task-done state** and real tags/categories/reminders (currently placeholder UI).
+- **An automated test suite** — testing so far has been manual (`curl` against every endpoint; `tsc` / `expo-doctor` / bundle-export checks on the client).
