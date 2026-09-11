@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.env
+.env
+
+# SQLite databases
+*.db
+*.sqlite3
+
+# Recorded audio (local test/user data, not source)
+backend/data/audio/
+*.wav
+*.m4a
+
+# Node / Expo
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# OS
+.DS_Store
